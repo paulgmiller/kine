@@ -43,7 +43,32 @@ func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, se
 	if err != nil {
 		return false, nil, fmt.Errorf("failed to create reader: %w", err)
 	}
-	return true, &Split{reader: reader, writer: writer}, nil
+	b := &Split{reader: reader, writer: writer}
+	_, scopedReader := reader.(server.ScopedBackend)
+	_, scopedWriter := writer.(server.ScopedBackend)
+	if scopedReader && scopedWriter {
+		return true, &scopedSplit{b}, nil
+	}
+	return true, b, nil
+}
+
+// Only expose the optional capability when both underlying drivers support it.
+// Otherwise the split wrapper must preserve the global-revision contract.
+type scopedSplit struct{ *Split }
+
+func (s *scopedSplit) Scope(ctx context.Context, key, end string) (server.Backend, string, error) {
+	r, rd, err := s.reader.(server.ScopedBackend).Scope(ctx, key, end)
+	if err != nil {
+		return nil, "", err
+	}
+	w, wd, err := s.writer.(server.ScopedBackend).Scope(ctx, key, end)
+	if err != nil {
+		return nil, "", err
+	}
+	if rd != wd {
+		return nil, "", errors.New("split backends disagree on revision domain")
+	}
+	return &scopedSplit{&Split{reader: r, writer: w}}, rd, nil
 }
 
 // explicit interface check

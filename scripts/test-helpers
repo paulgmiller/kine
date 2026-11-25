@@ -235,13 +235,20 @@ build-apiserver-tests() {
   fi
   # replace testserver package
   grep -rlF 'k8s.io/apiserver/pkg/storage/etcd3/testserver' pkg/ | xargs sed -i 's|k8s.io/apiserver/pkg/storage/etcd3/testserver|github.com/k3s-io/kine/pkg/testserver|'
-  # fix test that expects only 1 revision to exist at startup - kine has 2, as we store compact revision in a key.
-  sed -i 's|NewTooLargeResourceVersionError(uint64(102), 1, 0)|NewTooLargeResourceVersionError(uint64(102), 2, 0)|' pkg/storage/etcd3/watcher_test.go
+  if [[ "$KINE_NATIVE_SCOPED_TESTS" = true ]]; then
+    # Advance the resource under test, outside its /pods/ item keyspace.
+    # An unrelated key cannot advance a resource-scoped revision counter.
+    sed -i 's|client.KV.Put(ctx, "increaseRV", "ok")|client.KV.Put(ctx, "/pods", "ok")|' pkg/storage/etcd3/store_test.go
+  else
+    # Global kine drivers create two startup revisions.
+    sed -i 's|NewTooLargeResourceVersionError(uint64(102), 1, 0)|NewTooLargeResourceVersionError(uint64(102), 2, 0)|' pkg/storage/etcd3/watcher_test.go
+  fi
   # fix too-short test helper timeout that fails under load
   sed -i 's|waitTimeout = 100 \* waitDelay|waitTimeout = 500 \* waitDelay|' pkg/storage/etcd3/compact_test.go
   go mod edit --replace github.com/k3s-io/kine=$KINEPATH
   go mod tidy
-  go test -c -o $KINEPATH/bin/ -tags nats,kine_split_driver ./pkg/storage/etcd3/...
+  mkdir -p "${KINE_APISERVER_TEST_DIR:-$KINEPATH/bin}"
+  go test -c -o "${KINE_APISERVER_TEST_DIR:-$KINEPATH/bin}/" -tags nats,kine_split_driver ./pkg/storage/etcd3/...
   cd $KINEPATH
 }
 export -f build-apiserver-tests
@@ -249,10 +256,11 @@ export -f build-apiserver-tests
 # ---
 
 run-apiserver-tests() {
-  test -e ./bin/etcd3.test || build-apiserver-tests
-  for TEST in ./bin/*.test; do
+  local test_bin_dir=${KINE_APISERVER_TEST_DIR:-$PWD/bin}
+  test -e "$test_bin_dir/etcd3.test" || build-apiserver-tests
+  for TEST in "$test_bin_dir"/*.test; do
     # TODO: add RangeStream support - ref https://github.com/k3s-io/kine/issues/740
-    (set -x; $TEST -test.failfast -test.count 1 -test.parallel 1 -test.timeout 15m)
+    (set -x; "$TEST" -test.failfast -test.count 1 -test.parallel 1 -test.timeout 15m "$@")
   done
 }
 export -f run-apiserver-tests

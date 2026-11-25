@@ -3,6 +3,7 @@ Kine (Kine is not etcd)
 
 Kine is an etcdshim that provides an etcd-compatible API on top of various backend datastores:
 - SQL ([SQLite](/pkg/drivers/sqlite), [MySQL/MariaDB](/pkg/drivers/mysql), [Postgres](/pkg/drivers/pgsql))
+- [Native CockroachDB](/pkg/drivers/cockroach) (experimental, resource-scoped revisions and changefeed watches)
 - [Memory](/pkg/drivers/memory) (ephemeral btree)
 - [NATS](/pkg/drivers/nats) (embedded or external JetStream)
 - [T4](/pkg/drivers/t4) (standalone or with S3)

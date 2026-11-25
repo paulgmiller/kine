@@ -8,6 +8,11 @@ import (
 )
 
 func (l *LimitedServer) Put(ctx context.Context, r *etcdserverpb.PutRequest) (*etcdserverpb.PutResponse, error) {
+	var scopeErr error
+	l, scopeErr = l.forRange(ctx, r.Key, nil)
+	if scopeErr != nil {
+		return nil, scopeErr
+	}
 	if r.IgnoreValue {
 		return nil, unsupported("ignoreValue")
 	}

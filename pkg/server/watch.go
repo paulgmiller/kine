@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"sync"
@@ -30,6 +31,9 @@ func (s *KVServerBridge) Watch(ws etcdserverpb.Watch_WatchServer) error {
 		backend:  s.limited.backend,
 		watches:  map[int64]func(){},
 		progress: map[int64]chan<- int64{},
+		backends: map[int64]Backend{},
+		periodic: map[int64]bool{},
+		domains:  map[int64]string{},
 		server: &server{
 			id:       id,
 			ws:       ws,
@@ -86,6 +90,10 @@ type revAt struct {
 }
 
 func (s *server) Send(watchId, revision, compactRevision int64, events []*mvccpb.Event, created, canceled bool, cancelReason string) error {
+	return s.send(watchId, revision, compactRevision, events, created, canceled, cancelReason, false)
+}
+
+func (s *server) send(watchId, revision, compactRevision int64, events []*mvccpb.Event, created, canceled bool, cancelReason string, forceProgress bool) error {
 	s.Lock()
 	defer s.Unlock()
 	now := time.Now()
@@ -118,7 +126,7 @@ func (s *server) Send(watchId, revision, compactRevision int64, events []*mvccpb
 				rev.t = now
 			}
 		} else if rev, ok := s.maxRev[watchId]; ok {
-			if !hasEvents && now.Sub(rev.t) < s.interval {
+			if !hasEvents && !forceProgress && now.Sub(rev.t) < s.interval {
 				// watch will call Send even if all events have been filtered out, so that this function
 				// can track max seen revisions to determine if a watch is synced or not. This does mean
 				// that there is no way to tell the difference between a directed notification, and all
@@ -196,6 +204,9 @@ type watcher struct {
 	server   *server
 	watches  map[int64]func()
 	progress map[int64]chan<- int64
+	backends map[int64]Backend
+	periodic map[int64]bool
+	domains  map[int64]string
 	notify   atomic.Bool
 }
 
@@ -211,6 +222,17 @@ func (w *watcher) Create(ctx context.Context, r *etcdserverpb.WatchCreateRequest
 		w.CancelEarly(ctx, ErrCompacted)
 		return
 	}
+	backend := w.backend
+	domain := ""
+	_, scoped := backend.(ScopedBackend)
+	if s, ok := backend.(ScopedBackend); ok {
+		var err error
+		backend, domain, err = s.Scope(ctx, string(r.Key), string(r.RangeEnd))
+		if err != nil {
+			w.CancelEarly(ctx, err)
+			return
+		}
+	}
 
 	// NOTE: this lock is not released until watch() sends the created response,
 	// to ensure that create responses are not sent out of order.
@@ -220,6 +242,9 @@ func (w *watcher) Create(ctx context.Context, r *etcdserverpb.WatchCreateRequest
 
 	id := atomic.AddInt64(&watchID, 1)
 	w.watches[id] = cancel
+	w.backends[id] = backend
+	w.periodic[id] = r.ProgressNotify
+	w.domains[id] = domain
 
 	// redirect apiserver watches to the substitute compact revision key
 	// response is fixed up in toKV()
@@ -236,7 +261,7 @@ func (w *watcher) Create(ctx context.Context, r *etcdserverpb.WatchCreateRequest
 	}
 
 	var progressCh chan int64
-	if r.ProgressNotify {
+	if r.ProgressNotify || scoped {
 		progressCh = make(chan int64)
 		w.progress[id] = progressCh
 	}
@@ -244,14 +269,14 @@ func (w *watcher) Create(ctx context.Context, r *etcdserverpb.WatchCreateRequest
 	logrus.Tracef("WATCH CREATE server=%d, id=%d, key=%s, end=%s, revision=%d, progressNotify=%v, watchCount=%d", w.id, id, key, end, startRevision, r.ProgressNotify, len(w.watches))
 
 	w.wg.Add(1)
-	go w.watch(ctx, key, end, id, startRevision, progressCh)
+	go w.watch(ctx, backend, key, end, id, startRevision, progressCh, r.ProgressNotify)
 }
 
-func (w *watcher) watch(ctx context.Context, key, end string, id, startRevision int64, progressCh chan int64) {
+func (w *watcher) watch(ctx context.Context, backend Backend, key, end string, id, startRevision int64, progressCh chan int64, progressNotify bool) {
 	defer logrus.Tracef("WATCH CLOSE server=%d, id=%d, key=%s, end=%s", w.id, id, key, end)
 	defer w.wg.Done()
 
-	wr := w.backend.Watch(ctx, startRevision)
+	wr := backend.Watch(ctx, startRevision)
 	err := w.server.Send(id, wr.CurrentRevision, 0, nil, true, false, "")
 
 	// NOTE: this releases a lock taken in Create() that ensures that create
@@ -275,6 +300,7 @@ func (w *watcher) watch(ctx context.Context, key, end string, id, startRevision 
 	for outer {
 		var revision int64
 		var batch EventBatch
+		forceProgress := false
 
 		// Block on initial read from events or progress channel
 		select {
@@ -299,16 +325,33 @@ func (w *watcher) watch(ctx context.Context, key, end string, id, startRevision 
 			}
 			// get max revision from collected events
 			revision = batch.CurrentRev
-		case progressRev := <-progressCh:
+		case progressRev, ok := <-progressCh:
+			if !ok {
+				return
+			}
 			// have been requested to send progress with no events
 			revision = progressRev
+			forceProgress = true
+		case <-ctx.Done():
+			return
 		}
 
 		// send response - note that there are no events if this is a progress notification.
 		// only send with no events if the watcher has requested progress notifications.
 		events := toEvents(key, end, startRevision, batch)
-		if progressCh != nil || len(events) > 0 {
-			if err := w.server.Send(id, revision, 0, events, false, false, ""); err != nil {
+		if forceProgress && revision < w.server.maxRevision(id) {
+			continue
+		}
+		if !progressNotify && !forceProgress && len(events) == 0 {
+			if _, scoped := w.backend.(ScopedBackend); scoped {
+				w.server.Lock()
+				if tracked := w.server.maxRev[id]; tracked != nil && revision > tracked.r {
+					tracked.r = revision
+				}
+				w.server.Unlock()
+			}
+		} else {
+			if err := w.server.send(id, revision, 0, events, false, false, "", forceProgress); err != nil {
 				w.Cancel(id, 0, 0, err)
 			}
 		}
@@ -316,7 +359,11 @@ func (w *watcher) watch(ctx context.Context, key, end string, id, startRevision 
 
 	select {
 	case err := <-wr.Errorc:
-		w.Cancel(id, 0, 0, err)
+		compact := int64(0)
+		if errors.Is(err, ErrCompacted) {
+			compact = max(int64(1), startRevision)
+		}
+		w.Cancel(id, 0, compact, err)
 	default:
 		w.Cancel(id, 0, 0, nil)
 	}
@@ -348,6 +395,9 @@ func toEvent(event *Event) *mvccpb.Event {
 func (w *watcher) removeWatch(watchID int64) bool {
 	w.Lock()
 	defer w.Unlock()
+	delete(w.backends, watchID)
+	delete(w.periodic, watchID)
+	delete(w.domains, watchID)
 	if progressCh, ok := w.progress[watchID]; ok {
 		close(progressCh)
 		delete(w.progress, watchID)
@@ -415,6 +465,10 @@ func (w *watcher) Close() {
 // Ref: https://github.com/etcd-io/etcd/blob/v3.5.27/server/mvcc/watchable_store.go#L519-L523
 // Ref: https://github.com/kubernetes/kubernetes/blob/v1.35.1/staging/src/k8s.io/apiserver/pkg/storage/cacher/progress/watch_progress.go#L34-L36
 func (w *watcher) Progress(ctx context.Context) {
+	if _, ok := w.backend.(ScopedBackend); ok {
+		w.scopedProgress(ctx, true)
+		return
+	}
 	logrus.Tracef("WATCH REQUEST PROGRESS server=%d", w.id)
 	if w.notify.CompareAndSwap(false, true) {
 		go w.ProgressAll(ctx)
@@ -450,6 +504,10 @@ func (w *watcher) ProgressAll(ctx context.Context) {
 
 // ProgressIfSynced sends a progress report on any channels that are synced.
 func (w *watcher) ProgressIfSynced(ctx context.Context) {
+	if _, ok := w.backend.(ScopedBackend); ok {
+		w.scopedProgress(ctx, false)
+		return
+	}
 	logrus.Tracef("WATCH PROGRESS TICK server=%d", w.id)
 	if w.notify.Load() {
 		// Do not send direct progress to individual to watches if broadcast progress has been requested.
@@ -472,6 +530,35 @@ func (w *watcher) ProgressIfSynced(ctx context.Context) {
 			logrus.Tracef("WATCH PROGRESS TICK server=%d, id=%d, revision=%d synced", w.id, id, rev)
 			select {
 			case progressCh <- rev:
+			default:
+			}
+		}
+	}
+}
+
+// A directed response is essential: a broadcast revision would advance every
+// watch on the stream, including watches in unrelated revision domains.
+func (w *watcher) scopedProgress(ctx context.Context, requested bool) {
+	w.RLock()
+	defer w.RUnlock()
+	type revisionResult struct {
+		rev int64
+		err error
+	}
+	revisions := map[string]revisionResult{}
+	for id, ch := range w.progress {
+		if !requested && !w.periodic[id] {
+			continue
+		}
+		result, ok := revisions[w.domains[id]]
+		if !ok {
+			result.rev, result.err = w.backends[id].CurrentRevision(ctx)
+			revisions[w.domains[id]] = result
+		}
+		rev, err := result.rev, result.err
+		if err == nil && w.server.maxRevision(id) == rev {
+			select {
+			case ch <- rev:
 			default:
 			}
 		}

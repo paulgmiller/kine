@@ -14,7 +14,7 @@ WORKDIR ${KINE_SOURCE}
 COPY . ${KINE_SOURCE}
 
 FROM golang AS apiserver-tests
-RUN bash -c "export CGO_ENABLED=${CGO_ENABLED}; source ./scripts/test-helpers; build-apiserver-tests"
+RUN bash -c "export CGO_ENABLED=${CGO_ENABLED}; source ./scripts/test-helpers; build-apiserver-tests; KINE_NATIVE_SCOPED_TESTS=true KINE_APISERVER_TEST_DIR=\${PWD}/bin/cockroach-native build-apiserver-tests"
 
 FROM golang
 COPY --from=apiserver-tests ${KINE_SOURCE}/bin ${KINE_SOURCE}/bin

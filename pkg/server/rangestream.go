@@ -31,6 +31,11 @@ func adjustBatchSize(lastBatch, lastSize, targetSize int) int {
 }
 
 func (l *LimitedServer) RangeStream(r *etcdserverpb.RangeRequest, rs etcdserverpb.KV_RangeStreamServer) error {
+	var scopeErr error
+	l, scopeErr = l.forRange(rs.Context(), r.Key, r.RangeEnd)
+	if scopeErr != nil {
+		return scopeErr
+	}
 	if len(r.RangeEnd) == 0 {
 		return errors.New("invalid range end length of 0")
 	}
@@ -63,6 +68,9 @@ func (l *LimitedServer) RangeStream(r *etcdserverpb.RangeRequest, rs etcdserverp
 		logrus.Tracef("RANGESTREAM key=%s, end=%s, revision=%d, currentRev=%d limit=%d, keysOnly=%v", key, end, revision, lr.CurrentRevision, r.Limit, r.KeysOnly)
 
 		currentRev = lr.CurrentRevision
+		if revision == 0 {
+			revision = currentRev
+		}
 		batchSize := initialBatchSize
 		for kv := range lr.KVc {
 			if len(kvs) == batchSize {

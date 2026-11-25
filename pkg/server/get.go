@@ -9,6 +9,8 @@ import (
 )
 
 func (l *LimitedServer) get(ctx context.Context, r *etcdserverpb.RangeRequest) (*RangeResponse, error) {
+	_, scoped := l.backend.(ScopedBackend)
+	compactKey := bytes.Equal(r.Key, compactRevKey)
 	if r.Limit > 1 {
 		return nil, unsupported("limit")
 	}
@@ -20,6 +22,9 @@ func (l *LimitedServer) get(ctx context.Context, r *etcdserverpb.RangeRequest) (
 	}
 
 	rev, kv, err := l.backend.Get(ctx, string(r.Key), r.Revision, r.KeysOnly)
+	if scoped && compactKey {
+		rev = 0
+	}
 	if logrus.IsLevelEnabled(logrus.TraceLevel) {
 		logrus.Tracef("GET key=%s, revision=%d, currentRev=%d, keysOnly=%v", r.Key, r.Revision, rev, r.KeysOnly)
 	}

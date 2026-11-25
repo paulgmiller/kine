@@ -46,6 +46,14 @@ type Backend interface {
 	Compact(ctx context.Context, revision int64) (int64, error)
 }
 
+// ScopedBackend selects an independent revision domain for a key range. The
+// domain identifier is used to reject transactions spanning revision domains.
+// Implementations must return an error for ranges crossing domain boundaries.
+// Backends without this capability retain the global etcd revision contract.
+type ScopedBackend interface {
+	Scope(ctx context.Context, key, end string) (Backend, string, error)
+}
+
 type Dialect interface {
 	ListCurrent(ctx context.Context, key, end string, limit int64, includeDeleted, keysOnly bool) (*sql.Rows, error)
 	List(ctx context.Context, key, end string, limit, revision int64, includeDeleted, keysOnly bool) (*sql.Rows, error)
