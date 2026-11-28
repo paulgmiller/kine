@@ -290,12 +290,10 @@ func (s *SQLLog) compact(compactRev int64, targetCompactRev int64) (int64, int64
 	// out this will get rolled back. Otherwise it is possible for Compact to
 	// succeed within the time limit, but SetCompactRevision occurs too late, and
 	// the work is wasted.
-	advanced, err := t.SetCompactRevision(ctx, compactRev, targetCompactRev)
-	if err != nil {
-		return 0, 0, fmt.Errorf("failed to record compact revision: %w", err)
-	}
-
-	if !advanced {
+	if err := t.SetCompactRevision(ctx, compactRev, targetCompactRev); err != nil {
+		if !errors.Is(err, server.ErrCompacted) {
+			return 0, 0, fmt.Errorf("failed to record compact revision: %w", err)
+		}
 		latestCompactRev, err := t.GetCompactRevision(ctx)
 		if err != nil {
 			return 0, 0, err

@@ -72,13 +72,19 @@ func (t *Tx) GetCompactRevision(ctx context.Context) (int64, error) {
 	return id, err
 }
 
-func (t *Tx) SetCompactRevision(ctx context.Context, expected, target int64) (bool, error) {
+func (t *Tx) SetCompactRevision(ctx context.Context, expected, target int64) error {
 	result, err := t.execute(ctx, t.d.UpdateCompactSQL, target, expected)
 	if err != nil {
-		return false, err
+		return err
 	}
 	count, err := result.RowsAffected()
-	return count == 1, err
+	if err != nil {
+		return err
+	}
+	if count != 1 {
+		return server.ErrCompacted
+	}
+	return nil
 }
 
 func (t *Tx) Compact(ctx context.Context, from, to int64) (int64, error) {
